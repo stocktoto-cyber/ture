@@ -56,6 +56,12 @@ def fmt_price(v):
         return 'N/A'
     return f"{v:,.0f}" if v >= 100 else f"{v:.2f}"
 
+def normalize_yield(v):
+    """yfinance 對台灣 ETF 有時回傳百分比值（如 7.17）而非小數（0.0717），統一轉成小數"""
+    if v is None:
+        return None
+    return v / 100 if v > 1 else v
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_info(code_full: str) -> dict:
     try:
@@ -104,7 +110,7 @@ def calc_etf_score(info: dict):
     total  = 0
 
     exp_r   = info.get('annualReportExpenseRatio') or info.get('expenseRatio')
-    div_y   = info.get('dividendYield') or info.get('yield')
+    div_y   = normalize_yield(info.get('dividendYield') or info.get('yield'))
     ret_3yr = info.get('threeYearAverageReturn')
     ret_1yr = info.get('oneYearTotalReturn') or info.get('ytdReturn')
     assets  = info.get('totalAssets')
@@ -186,13 +192,14 @@ def lynch_etf_voice(info, score, detail):
     assets  = info.get('totalAssets')
     ret_3yr = info.get('threeYearAverageReturn')
 
+    div_y_n = normalize_yield(div_y)
     if exp_r is not None:
         if exp_r <= 0.003:
             lines.append(f"✅ 費用率 **{exp_r*100:.2f}%** 非常低。林區說：長期下來，低費用是複利的朋友，每省一分費用都是淨報酬。")
         elif exp_r > 0.01:
             lines.append(f"⚠️ 費用率 **{exp_r*100:.2f}%** 偏高。每年都在侵蝕你的報酬，有低費用的替代品嗎？")
-    if div_y is not None and div_y > 0.04:
-        lines.append(f"💰 殖利率 **{div_y*100:.2f}%**，對存股族來說很吸引人。林區提醒：也要確認這殖利率能否持續。")
+    if div_y_n is not None and div_y_n > 0.04:
+        lines.append(f"💰 殖利率 **{div_y_n*100:.2f}%**，對存股族來說很吸引人。林區提醒：也要確認這殖利率能否持續。")
     if ret_3yr is not None:
         if ret_3yr >= 0.15:
             lines.append(f"📈 三年平均報酬 **{ret_3yr*100:.1f}%**，表現亮眼。但記住：過去績效不代表未來。")
@@ -211,7 +218,7 @@ def classify_lynch(info: dict, code_base: str) -> str:
     rev_g    = info.get('revenueGrowth')
     sector   = info.get('sector', '') or ''
     industry = info.get('industry', '') or ''
-    div_y    = info.get('dividendYield', 0) or 0
+    div_y    = normalize_yield(info.get('dividendYield') or 0) or 0
 
     for kw in CYCLICAL_SECTORS:
         if kw in sector or kw in industry:
@@ -452,7 +459,7 @@ with tab1:
         pe    = info.get('trailingPE')
         eps_g = info.get('earningsGrowth')
         rev_g = info.get('revenueGrowth')
-        div_y = info.get('dividendYield')
+        div_y = normalize_yield(info.get('dividendYield'))
 
         if is_etf_:
             exp_r   = info.get('annualReportExpenseRatio') or info.get('expenseRatio')
@@ -720,12 +727,13 @@ with tab2:
             st.caption("🟢 個股評分 ≥ 65　🟡 50–64　🔴 < 50　🔵 ETF")
 
         st.markdown("---")
-        st.markdown("""
-> 💬 *「股票市場是把錢從急躁者的口袋，轉移到有耐心者的口袋。」— 彼得林區*
-
-**林區投資核心原則：**
-1. **了解你買的每一支股票**：說得出公司如何賺錢，才有資格持有。
-2. **PEG < 1 是最好的起點**：成長快、股價合理，才是林區的最愛。
-3. **不要因為股價下跌就賣**：如果基本面沒壞，跌是加碼機會。
-4. **長期持有才能讓複利發揮**：林區的 Magellan 基金年均報酬 29%，靠的是持有，不是頻繁交易。
-        """)
+        st.markdown("---")
+        st.markdown(
+            "> 💬 *「股票市場是把錢從急躁者的口袋，"
+            "轉移到有耐心者的口袋。」— 彼得林區*"
+        )
+        st.markdown("**林區投資核心原則：**")
+        st.write("1. **了解你買的每一支股票**：說得出公司如何賣錢，才有資格持有。")
+        st.write("2. **PEG < 1 是最好的起點**：成長快、股價合理，才是林區的最愛。")
+        st.write("3. **不要因為股價下跌就賣**：如果基本面沒壞，跨是加碼機會。")
+        st.write("4. **長期持有才能讓複利發揮**：林區的 Magellan 基金年均報酬 29%，靠的是持有，不是頻繁交易。")
