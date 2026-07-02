@@ -57,10 +57,16 @@ def fmt_price(v):
     return f"{v:,.0f}" if v >= 100 else f"{v:.2f}"
 
 def normalize_yield(v):
-    """yfinance 對台灣 ETF 有時回傳百分比值（如 7.17）而非小數（0.0717），統一轉成小數"""
+    """
+    yfinance 台灣股票 dividendYield 格式不一致：
+      7.17  → ETF 高殖利率，需除以 100 → 0.0717 (7.17%)
+      0.96  → TSMC 等個股，實為 0.96%，也需除以 100 → 0.0096
+      0.03  → 已是正確小數，無需處理 (3%)
+    門檻：> 0.2（台股殖利率超過 20% 幾乎不可能是小數格式）
+    """
     if v is None:
         return None
-    return v / 100 if v > 1 else v
+    return v / 100 if v > 0.2 else v
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_info(code_full: str) -> dict:
@@ -547,26 +553,51 @@ with tab2:
     st.subheader("💼 持股體檢")
     st.caption("輸入你的持股，系統用彼得林區標準逐一評估，給出留 / 觀察 / 減碼建議。")
 
-    with st.expander("📝 輸入持股清單", expanded=True):
-        st.caption("格式：股票代號, 持股張數, 平均成本（每行一支，成本可不填）")
-        default_txt = (
-            "2330, 1, 900\n"
-            "0056, 5, 35\n"
-            "00878, 10, 20\n"
-            "2886, 2, 42\n"
-        )
-        port_text = st.text_area("持股清單:", value=default_txt, height=160, label_visibility="collapsed")
-        btn2 = st.button("🔍 開始體檢", type="primary")
+    # ── 互動式表格輸入 ──────────────────────────────
+    default_df = pd.DataFrame([
+        {"股票代號": "2330", "持股張數": 3,   "平均成本(元)": 1580.0},
+        {"股票代號": "0056", "持股張數": 212, "平均成本(元)": 31.0},
+        {"股票代號": "00878","持股張數": 222, "平均成本(元)": 19.1},
+        {"股票代號": "2886", "持股張數": 11,  "平均成本(元)": 26.5},
+    ])
+
+    edited_df = st.data_editor(
+        default_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "股票代號": st.column_config.TextColumn(
+                "股票代號", help="台股代號，例：2330、0056、00878", width="small"
+            ),
+            "持股張數": st.column_config.NumberColumn(
+                "持股張數（張）", help="1張 = 1000股", min_value=0, step=1, width="small"
+            ),
+            "平均成本(元)": st.column_config.NumberColumn(
+                "平均成本（元）", help="每股平均買入成本，可留空", min_value=0, step=0.1, width="small"
+            ),
+        },
+        hide_index=True,
+        key="portfolio_editor"
+    )
+
+    st.caption("💡 點格子可直接編輯；最左側 ＋ 號新增一列；勾選列後按 Delete 刪除")
+    btn2 = st.button("🔍 開始體檢", type="primary", use_container_width=False)
 
     if btn2:
         holdings = []
-        for line in port_text.strip().splitlines():
-            parts = [p.strip() for p in line.split(',')]
-            if not parts or not parts[0]:
+        for _, row in edited_df.iterrows():
+            code_r = str(row.get("股票代號", "")).strip()
+            if not code_r:
                 continue
-            code_r  = parts[0].strip()
-            boards  = float(parts[1].replace(',', '')) if len(parts) > 1 and parts[1].strip() else 1
-            cost_pp = float(parts[2].replace(',', '')) if len(parts) > 2 and parts[2].strip() else None
+            try:
+                boards = float(row.get("持股張數") or 1)
+            except Exception:
+                boards = 1
+            try:
+                cost_val = row.get("平均成本(元)")
+                cost_pp = float(cost_val) if cost_val and not pd.isna(cost_val) and cost_val > 0 else None
+            except Exception:
+                cost_pp = None
             holdings.append({'code': code_r, 'boards': boards, 'cost': cost_pp})
 
         if not holdings:
@@ -721,19 +752,15 @@ with tab2:
                 height=380,
                 margin=dict(t=10, b=10, l=10, r=10),
                 legend=dict(font=dict(size=12)),
-                annotations=[dict(text='市值分配', x=0.5, y=0.5, font_size=14, showarrow=False)]
+                annotations=[dict(text='市値分配', x=0.5, y=0.5, font_size=14, showarrow=False)]
             )
             st.plotly_chart(fig_pie, use_container_width=True)
             st.caption("🟢 個股評分 ≥ 65　🟡 50–64　🔴 < 50　🔵 ETF")
 
         st.markdown("---")
-        st.markdown("---")
-        st.markdown(
-            "> 💬 *「股票市場是把錢從急躁者的口袋，"
-            "轉移到有耐心者的口袋。」— 彼得林區*"
-        )
+        st.write("> *「股票市場是把錢從急躁者的口袋，轉移到有耐心者的口袋。」 — 彼得林區*")
         st.markdown("**林區投資核心原則：**")
-        st.write("1. **了解你買的每一支股票**：說得出公司如何賣錢，才有資格持有。")
+        st.write("1. **了解你買的每一支股票**：說得出公司如何賺錢，才有資格持有。")
         st.write("2. **PEG < 1 是最好的起點**：成長快、股價合理，才是林區的最愛。")
-        st.write("3. **不要因為股價下跌就賣**：如果基本面沒壞，跨是加碼機會。")
+        st.write("3. **不要因為股價下跌就賣**：如果基本面沒壞，跌是加碼機會。")
         st.write("4. **長期持有才能讓複利發揮**：林區的 Magellan 基金年均報酬 29%，靠的是持有，不是頻繁交易。")
