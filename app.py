@@ -21,16 +21,14 @@ st.set_page_config(
 # 1. 常數與設定
 # ══════════════════════════════════════════════════
 
-# 台股 ETF 清單（輔助偵測，yfinance quoteType 為主）
 ETF_CODES = {
     '0050','0056','00878','00919','00881','006208',
     '00757','00675L','00631L','00713','00929','00981A',
     '00692','00850','00896','00900','00905','00912',
-    '00900','00940','00941','00946','00953B','00960',
+    '00940','00941','00946','00953B','00960',
     '00679B','00687B','00720B','00764B','00772B',
 }
 
-# 林區 6 大分類
 LYNCH_CAT = {
     'fast':      ('🚀 快速成長股', '林區最愛！年成長 > 15%，PEG < 1 是絕佳機會。'),
     'stalwart':  ('📈 穩定成長股', '大型穩健，適合長期持有。留意不要付太高 P/E。'),
@@ -41,7 +39,6 @@ LYNCH_CAT = {
     'etf':       ('📦 ETF／指數基金','分散工具，適合定期定額長期持有，林區建議不挑個股者優先選擇。'),
 }
 
-# 台灣景氣循環類股（部分）
 CYCLICAL_SECTORS = {'半導體', '航運', '鋼鐵', '塑化', '紙類', '建材營造', 'Semiconductors', 'Steel', 'Shipping'}
 
 # ══════════════════════════════════════════════════
@@ -61,12 +58,9 @@ def fmt_price(v):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_info(code_full: str) -> dict:
-    """抓取 yfinance info + 補算 EPS 成長"""
     try:
         t = yf.Ticker(code_full)
         info = dict(t.info or {})
-
-        # 若 earningsGrowth 缺失，嘗試從財報手動計算
         if not info.get('earningsGrowth'):
             try:
                 fin = t.financials
@@ -82,7 +76,6 @@ def fetch_info(code_full: str) -> dict:
                             info['earningsGrowth'] = (ni_row.iloc[0] - base) / abs(base)
             except Exception:
                 pass
-
         return info
     except Exception:
         return {}
@@ -102,41 +95,33 @@ def fetch_price(code_full: str):
 # ══════════════════════════════════════════════════
 
 def is_etf(info: dict, code_base: str) -> bool:
-    """自動偵測 ETF（quoteType 為主，硬編碼清單為輔）"""
     qt = (info.get('quoteType') or '').upper()
     return qt == 'ETF' or code_base in ETF_CODES
 
 def calc_etf_score(info: dict):
-    """
-    ETF 專屬評分（0–100）
-    費用率(30) + 殖利率(30) + 3年報酬(25) + 資產規模(15)
-    回傳 (總分, 明細 dict)
-    """
+    """ETF 專屬評分（0–100）：費用率(30) + 殖利率(30) + 3年報酬(25) + 規模(15)"""
     detail = {}
     total  = 0
 
-    exp_r     = info.get('annualReportExpenseRatio') or info.get('expenseRatio')
-    div_y     = info.get('dividendYield') or info.get('yield')
-    ret_3yr   = info.get('threeYearAverageReturn')
-    ret_1yr   = info.get('oneYearTotalReturn') or info.get('ytdReturn')
-    assets    = info.get('totalAssets')
+    exp_r   = info.get('annualReportExpenseRatio') or info.get('expenseRatio')
+    div_y   = info.get('dividendYield') or info.get('yield')
+    ret_3yr = info.get('threeYearAverageReturn')
+    ret_1yr = info.get('oneYearTotalReturn') or info.get('ytdReturn')
+    assets  = info.get('totalAssets')
 
-    # ── 1. 費用率（30 分）：越低越好 ──────────────
     exp_score = 0
     if exp_r is not None:
-        if   exp_r <= 0.001: exp_score = 30   # ≤0.1%
-        elif exp_r <= 0.003: exp_score = 25   # ≤0.3%
-        elif exp_r <= 0.005: exp_score = 18   # ≤0.5%
-        elif exp_r <= 0.010: exp_score = 10   # ≤1.0%
+        if   exp_r <= 0.001: exp_score = 30
+        elif exp_r <= 0.003: exp_score = 25
+        elif exp_r <= 0.005: exp_score = 18
+        elif exp_r <= 0.010: exp_score = 10
         else:                exp_score = 4
     detail['費用率'] = {
         'val': f"{exp_r*100:.2f}%" if exp_r is not None else 'N/A',
-        'score': exp_score, 'max': 30,
-        'note': '越低越好，林區建議 < 0.3%'
+        'score': exp_score, 'max': 30, 'note': '越低越好，林區建議 < 0.3%'
     }
     total += exp_score
 
-    # ── 2. 殖利率（30 分）────────────────────────
     div_score = 0
     if div_y is not None:
         y = div_y * 100
@@ -147,12 +132,10 @@ def calc_etf_score(info: dict):
         elif y >= 1.0: div_score = 6
     detail['股息殖利率'] = {
         'val': f"{div_y*100:.2f}%" if div_y is not None else 'N/A',
-        'score': div_score, 'max': 30,
-        'note': '高殖利率 ETF 適合存股族'
+        'score': div_score, 'max': 30, 'note': '高殖利率 ETF 適合存股族'
     }
     total += div_score
 
-    # ── 3. 三年平均報酬（25 分）──────────────────
     ret_score = 0
     ret_val   = ret_3yr if ret_3yr is not None else ret_1yr
     ret_label = '3年平均報酬' if ret_3yr is not None else '近1年報酬'
@@ -165,26 +148,23 @@ def calc_etf_score(info: dict):
         elif r >=  0: ret_score = 3
     detail[ret_label] = {
         'val': f"{ret_val*100:.1f}%" if ret_val is not None else 'N/A',
-        'score': ret_score, 'max': 25,
-        'note': '歷史績效參考（過去≠未來）'
+        'score': ret_score, 'max': 25, 'note': '歷史績效參考（過去≠未來）'
     }
     total += ret_score
 
-    # ── 4. 資產規模 AUM（15 分）──────────────────
-    aum_score = 0
-    if assets:
-        if   assets >= 1e11: aum_score = 15   # ≥1000億
-        elif assets >= 1e10: aum_score = 12   # ≥100億
-        elif assets >= 1e9:  aum_score = 7    # ≥10億
-        elif assets >= 1e8:  aum_score = 3    # ≥1億
     def fmt_aum(v):
         if not v: return 'N/A'
         if v >= 1e8: return f"{v/1e8:.0f} 億"
         return f"{v/1e4:.0f} 萬"
+    aum_score = 0
+    if assets:
+        if   assets >= 1e11: aum_score = 15
+        elif assets >= 1e10: aum_score = 12
+        elif assets >= 1e9:  aum_score = 7
+        elif assets >= 1e8:  aum_score = 3
     detail['資產規模 AUM'] = {
         'val': fmt_aum(assets),
-        'score': aum_score, 'max': 15,
-        'note': '規模越大流動性越好、越穩定'
+        'score': aum_score, 'max': 15, 'note': '規模越大流動性越好、越穩定'
     }
     total += aum_score
 
@@ -200,7 +180,6 @@ def grade_etf(score):
 
 
 def lynch_etf_voice(info, score, detail):
-    """林區對 ETF 的評語"""
     lines = []
     exp_r   = info.get('annualReportExpenseRatio') or info.get('expenseRatio')
     div_y   = info.get('dividendYield') or info.get('yield')
@@ -212,19 +191,15 @@ def lynch_etf_voice(info, score, detail):
             lines.append(f"✅ 費用率 **{exp_r*100:.2f}%** 非常低。林區說：長期下來，低費用是複利的朋友，每省一分費用都是淨報酬。")
         elif exp_r > 0.01:
             lines.append(f"⚠️ 費用率 **{exp_r*100:.2f}%** 偏高。每年都在侵蝕你的報酬，有低費用的替代品嗎？")
-
     if div_y is not None and div_y > 0.04:
         lines.append(f"💰 殖利率 **{div_y*100:.2f}%**，對存股族來說很吸引人。林區提醒：也要確認這殖利率能否持續。")
-
     if ret_3yr is not None:
         if ret_3yr >= 0.15:
             lines.append(f"📈 三年平均報酬 **{ret_3yr*100:.1f}%**，表現亮眼。但記住：過去績效不代表未來。")
         elif ret_3yr < 0:
             lines.append(f"📉 三年平均報酬 **{ret_3yr*100:.1f}%** 是負的。這段時間標的市場表現不佳，評估是否符合你的長期邏輯。")
-
     if assets and assets < 1e9:
         lines.append("⚠️ 資產規模較小，流動性風險較高，進出場時要注意成交量。")
-
     lines.append("📦 **林區對 ETF 的核心觀點**：「如果你沒有時間研究個股，買廣泛市場指數 ETF，然後定期定額、長期持有。這是大多數人最聰明的做法。」")
     return lines
 
@@ -232,53 +207,37 @@ def lynch_etf_voice(info, score, detail):
 def classify_lynch(info: dict, code_base: str) -> str:
     if is_etf(info, code_base):
         return 'etf'
+    eps_g    = info.get('earningsGrowth')
+    rev_g    = info.get('revenueGrowth')
+    sector   = info.get('sector', '') or ''
+    industry = info.get('industry', '') or ''
+    div_y    = info.get('dividendYield', 0) or 0
 
-    eps_g   = info.get('earningsGrowth')
-    rev_g   = info.get('revenueGrowth')
-    sector  = info.get('sector', '') or ''
-    industry= info.get('industry', '') or ''
-    div_y   = info.get('dividendYield', 0) or 0
-
-    # 景氣循環
     for kw in CYCLICAL_SECTORS:
         if kw in sector or kw in industry:
             return 'cyclical'
-
-    # 快速成長：EPS 或營收 > 15%
     if (eps_g and eps_g > 0.15) or (rev_g and rev_g > 0.15):
         return 'fast'
-
-    # 緩慢成長：成長 < 5% 且高股息
     if eps_g is not None and eps_g < 0.05 and div_y > 0.03:
         return 'slow'
-
-    # 轉機：獲利負成長但幅度縮小（簡化判斷）
     if eps_g is not None and -0.4 < eps_g < 0:
         return 'turnaround'
-
-    # 穩定成長：其餘
     return 'stalwart'
 
 
 def calc_score(info: dict, code_base: str):
-    """
-    回傳 (總分 int|None, 明細 dict, peg float|None)
-    ETF 回傳 (None, {}, None)
-    """
-    if code_base in ETF_CODES:
+    if is_etf(info, code_base):
         return None, {}, None
 
     detail = {}
     total  = 0
+    pe      = info.get('trailingPE')
+    eps_g   = info.get('earningsGrowth')
+    rev_g   = info.get('revenueGrowth')
+    debt_eq = info.get('debtToEquity')
+    cash    = info.get('totalCash')
+    debt    = info.get('totalDebt')
 
-    pe       = info.get('trailingPE')
-    eps_g    = info.get('earningsGrowth')
-    rev_g    = info.get('revenueGrowth')
-    debt_eq  = info.get('debtToEquity')       # yfinance 單位：百分比（50 = 50%）
-    cash     = info.get('totalCash')
-    debt     = info.get('totalDebt')
-
-    # ── 1. PEG 比率（35 分）★ 林區核心指標 ★ ──────
     peg = None
     peg_score = 0
     if pe and eps_g and eps_g > 0:
@@ -289,12 +248,10 @@ def calc_score(info: dict, code_base: str):
         elif peg <= 1.5:  peg_score = 10
     detail['PEG 比率'] = {
         'val': f"{peg:.2f}" if peg else 'N/A',
-        'score': peg_score, 'max': 35,
-        'note': 'PEG < 1 = 低估、< 0.5 = 超值'
+        'score': peg_score, 'max': 35, 'note': 'PEG < 1 = 低估、< 0.5 = 超值'
     }
     total += peg_score
 
-    # ── 2. EPS 年成長率（25 分）──────────────────
     eps_score = 0
     if eps_g is not None:
         g = eps_g * 100
@@ -304,33 +261,29 @@ def calc_score(info: dict, code_base: str):
         elif g >  5: eps_score = 8
     detail['EPS 年成長率'] = {
         'val': f"{eps_g*100:.1f}%" if eps_g is not None else 'N/A',
-        'score': eps_score, 'max': 25,
-        'note': '林區偏好 > 15% 的高成長'
+        'score': eps_score, 'max': 25, 'note': '林區偏好 > 15% 的高成長'
     }
     total += eps_score
 
-    # ── 3. 負債比（20 分）────────────────────────
     debt_score = 0
     if debt_eq is not None:
-        d = debt_eq / 100   # 轉回小數
+        d = debt_eq / 100
         if   d < 0.25: debt_score = 20
         elif d < 0.50: debt_score = 15
         elif d < 1.00: debt_score = 8
     detail['負債／股東權益'] = {
         'val': f"{debt_eq:.0f}%" if debt_eq is not None else 'N/A',
-        'score': debt_score, 'max': 20,
-        'note': '越低越安全，林區偏好低負債公司'
+        'score': debt_score, 'max': 20, 'note': '越低越安全，林區偏好低負債公司'
     }
     total += debt_score
 
-    # ── 4. 現金覆蓋率（10 分）───────────────────
     cash_score = 0
     if cash and debt:
         ratio = cash / debt
         if   ratio >= 1.0: cash_score = 10
         elif ratio >= 0.5: cash_score = 5
     elif cash and not debt:
-        cash_score = 10   # 無負債
+        cash_score = 10
     cash_str = 'N/A'
     if cash and debt and debt > 0:
         cash_str = f"{cash/debt:.0%}"
@@ -338,12 +291,10 @@ def calc_score(info: dict, code_base: str):
         cash_str = '無負債'
     detail['現金覆蓋負債'] = {
         'val': cash_str,
-        'score': cash_score, 'max': 10,
-        'note': '現金 > 負債 = 財務安全邊際高'
+        'score': cash_score, 'max': 10, 'note': '現金 > 負債 = 財務安全邊際高'
     }
     total += cash_score
 
-    # ── 5. 營收年成長（10 分）───────────────────
     rev_score = 0
     if rev_g is not None:
         g = rev_g * 100
@@ -352,8 +303,7 @@ def calc_score(info: dict, code_base: str):
         elif g >  0: rev_score = 3
     detail['營收年成長率'] = {
         'val': f"{rev_g*100:.1f}%" if rev_g is not None else 'N/A',
-        'score': rev_score, 'max': 10,
-        'note': '成長動能持續性'
+        'score': rev_score, 'max': 10, 'note': '成長動能持續性'
     }
     total += rev_score
 
@@ -361,7 +311,6 @@ def calc_score(info: dict, code_base: str):
 
 
 def grade(score):
-    """(星星, 文字說明)"""
     if score >= 80: return '⭐⭐⭐⭐⭐', '林區強力推薦'
     if score >= 65: return '⭐⭐⭐⭐',   '符合林區標準'
     if score >= 50: return '⭐⭐⭐',     '部分符合，持續觀察'
@@ -384,12 +333,9 @@ def action(score, pnl_pct=None):
 
 
 def lynch_voice(info, score, peg, cat_key):
-    """模擬林區會說的話（一段評語）"""
     lines = []
     eps_g   = info.get('earningsGrowth')
-    rev_g   = info.get('revenueGrowth')
     debt_eq = info.get('debtToEquity')
-    pe      = info.get('trailingPE')
     cash    = info.get('totalCash')
     debt    = info.get('totalDebt')
 
@@ -485,13 +431,12 @@ with tab1:
         is_etf_ = (cat_key == 'etf')
         score, detail, peg = calc_score(info, code_base)
         etf_score, etf_detail = calc_etf_score(info) if is_etf_ else (None, {})
-        display_score = etf_score if is_etf_ else score
+
         if is_etf_:
             stars, grade_text = grade_etf(etf_score)
         else:
             stars, grade_text = grade(score) if score is not None else ('📦', 'ETF')
 
-        # ── 標題列 ──────────────────────────────────
         st.subheader(f"{name}　{code_base}")
         c_cat, c_act = st.columns([1, 2])
         with c_cat:
@@ -501,12 +446,9 @@ with tab1:
                 st.metric("ETF 綜合評分", f"{etf_score} / 100", grade_text)
             elif score is not None:
                 st.metric("林區評分", f"{score} / 100", grade_text)
-            else:
-                st.info("ETF 不適用個股林區評分")
 
         st.markdown("---")
 
-        # ── KPI 列 ──────────────────────────────────
         pe    = info.get('trailingPE')
         eps_g = info.get('earningsGrowth')
         rev_g = info.get('revenueGrowth')
@@ -517,17 +459,17 @@ with tab1:
             ret_3yr = info.get('threeYearAverageReturn')
             ret_1yr = info.get('oneYearTotalReturn') or info.get('ytdReturn')
             assets  = info.get('totalAssets')
-            m1, m2, m3, m4, m5, m6 = st.columns(6)
-            m1.metric("目前股價",     f"${fmt_price(price)}" if price else 'N/A')
-            m2.metric("股息殖利率",   f"{div_y*100:.2f}%" if div_y else 'N/A')
-            m3.metric("費用率",       f"{exp_r*100:.3f}%" if exp_r else 'N/A')
-            m4.metric("3年平均報酬",  f"{ret_3yr*100:.1f}%" if ret_3yr else ('N/A'))
-            m5.metric("近1年報酬",    f"{ret_1yr*100:.1f}%" if ret_1yr else 'N/A')
             def fmt_aum2(v):
                 if not v: return 'N/A'
                 if v >= 1e8: return f"{v/1e8:.0f}億"
                 return f"{v/1e4:.0f}萬"
-            m6.metric("資產規模",     fmt_aum2(assets))
+            m1, m2, m3, m4, m5, m6 = st.columns(6)
+            m1.metric("目前股價",   f"${fmt_price(price)}" if price else 'N/A')
+            m2.metric("股息殖利率", f"{div_y*100:.2f}%" if div_y else 'N/A')
+            m3.metric("費用率",     f"{exp_r*100:.3f}%" if exp_r else 'N/A')
+            m4.metric("3年平均報酬",f"{ret_3yr*100:.1f}%" if ret_3yr else 'N/A')
+            m5.metric("近1年報酬",  f"{ret_1yr*100:.1f}%" if ret_1yr else 'N/A')
+            m6.metric("資產規模",   fmt_aum2(assets))
         else:
             m1, m2, m3, m4, m5, m6 = st.columns(6)
             m1.metric("目前股價",   f"${fmt_price(price)}" if price else 'N/A')
@@ -539,7 +481,6 @@ with tab1:
             m5.metric("營收成長",   f"{rev_g*100:.1f}%" if rev_g else 'N/A')
             m6.metric("股息殖利率", f"{div_y*100:.2f}%" if div_y else 'N/A')
 
-        # ── 評分明細 ────────────────────────────────
         def render_score_detail(det, radar_color, fill_color, title):
             st.markdown(f"### 📊 {title}")
             cats_r = list(det.keys())
@@ -583,7 +524,6 @@ with tab1:
             st.markdown("### 💬 如果彼得林區持有這檔 ETF，他會說⋯")
             for line in lynch_etf_voice(info, etf_score, etf_detail):
                 st.write(line)
-
         elif score is not None:
             render_score_detail(detail, '#F59E0B', 'rgba(255,215,0,0.15)', '林區評分明細')
             st.markdown(f"### 💡 建議：{action(score)}")
@@ -612,7 +552,6 @@ with tab2:
         btn2 = st.button("🔍 開始體檢", type="primary")
 
     if btn2:
-        # 解析輸入
         holdings = []
         for line in port_text.strip().splitlines():
             parts = [p.strip() for p in line.split(',')]
@@ -636,31 +575,29 @@ with tab2:
             price_ = fetch_price(code_f)
 
             name_ = info_.get('longName') or info_.get('shortName') or code_b
-            # 截短名稱
             if len(name_) > 12:
                 name_ = name_[:10] + '…'
 
-            cat_k = classify_lynch(info_, code_b)
+            cat_k    = classify_lynch(info_, code_b)
             cat_n, _ = LYNCH_CAT[cat_k]
             is_etf_h = (cat_k == 'etf')
             sc, det, pg = calc_score(info_, code_b)
+
             if is_etf_h:
                 etf_sc, _ = calc_etf_score(info_)
                 st_stars, _ = grade_etf(etf_sc)
-                sc = etf_sc   # 以 ETF 評分填入表格
+                sc = etf_sc
             else:
-                etf_sc = None
-                st_stars, _ = grade(sc) if sc is not None else ('📦', '')
+                st_stars, _ = grade(sc) if sc is not None else ('⭐', '')
 
-            # 損益計算（1張 = 1000股）
             shares_count = h['boards'] * 1000
             cost_total   = (h['cost'] * shares_count) if h['cost'] else None
             val_total    = (price_ * shares_count) if price_ else None
             pnl_         = (val_total - cost_total) if (val_total and cost_total) else None
             pnl_pct_     = ((price_ - h['cost']) / h['cost'] * 100) if (price_ and h['cost']) else None
 
-            pe_   = info_.get('trailingPE')
-            eps_g_= info_.get('earningsGrowth')
+            pe_    = info_.get('trailingPE')
+            eps_g_ = info_.get('earningsGrowth')
 
             return {
                 '代號':       code_b,
@@ -676,9 +613,8 @@ with tab2:
                 '林區分數':   sc if sc is not None else 0,
                 '評級':       st_stars,
                 '林區建議':   action(sc, pnl_pct_),
-                # 排序用
                 '_score':     sc or 0,
-                             '_cost':      cost_total or 0,
+                '_cost':      cost_total or 0,
                 '_val':       val_total or 0,
                 '_pnl':       pnl_ or 0,
                 '_pnl_pct':   pnl_pct_,
@@ -783,20 +719,6 @@ with tab2:
             st.plotly_chart(fig_pie, use_container_width=True)
             st.caption("🟢 個股評分 ≥ 65　🟡 50–64　🔴 < 50　🔵 ETF")
 
-        st.markdown("---")
-        st.markdown("""
-> 💬 *「股票市場是把錢從急躁者的口袋，轉移到有耐心者的口袋。」— 彼得林區*
-
-**林區投資核心原則：**
-1. **了解你買的每一支股票**：說得出公司如何賺錢，才有資格持有。
-2. **PEG < 1 是最好的起點**：成長快、股價合理，才是林區的最愛。
-3. **不要因為股價下跌就賣**：如果基本面沒壞，跌是加碼機會。
-4. **長期持有才能讓複利發揮**：林區的 Magellan 基金年均報酬 29%，靠的是持有，不是頻繁交易。
-        """)
- use_container_width=True)
-            st.caption("🟢 林區評分 ≥ 65　🟡 50–64　🔴 < 50　🔵 ETF")
-
-        # ── 林區名言收尾 ────────────────────────────
         st.markdown("---")
         st.markdown("""
 > 💬 *「股票市場是把錢從急躁者的口袋，轉移到有耐心者的口袋。」— 彼得林區*
