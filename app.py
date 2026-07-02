@@ -45,28 +45,35 @@ CYCLICAL_SECTORS = {'半導體', '航運', '鋼鐵', '塑化', '紙類', '建材
 # 2. 工具函式
 # ══════════════════════════════════════════════════
 
+def is_us_stock(code: str) -> bool:
+    """純英文字母 = 美股（VOO、VT、TSM、AAPL 等），含數字 = 台股"""
+    base = code.replace('.TW', '').replace('.TWO', '').replace('.US', '')
+    return base.isalpha()
+
 def normalize(code: str) -> str:
+    """自動判斷台股/美股，台股加 .TW，美股保持原樣"""
     code = code.strip().upper()
-    if '.' not in code:
-        code += '.TW'
-    return code
+    if '.' in code:
+        return code
+    if is_us_stock(code):
+        return code          # 美股：VOO、TSM、AAPL 直接用
+    return code + '.TW'      # 台股：2330 → 2330.TW
 
 def fmt_price(v):
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return 'N/A'
-    return f"{v:,.0f}" if v >= 100 else f"{v:.2f}"
+    return f"{v:,.2f}" if v < 100 else f"{v:,.0f}"
 
-def normalize_yield(v):
+def normalize_yield(v, is_tw=True):
     """
-    yfinance 台灣股票 dividendYield 格式不一致：
-      7.17  → ETF 高殖利率，需除以 100 → 0.0717 (7.17%)
-      0.96  → TSMC 等個股，實為 0.96%，也需除以 100 → 0.0096
-      0.03  → 已是正確小數，無需處理 (3%)
-    門檻：> 0.2（台股殖利率超過 20% 幾乎不可能是小數格式）
+    台股 yfinance dividendYield 格式混亂（0.96 代表 0.96%），門檻 > 0.2 時除以 100
+    美股 yfinance 回傳正確小數（0.013 = 1.3%），不需修正
     """
     if v is None:
         return None
-    return v / 100 if v > 0.2 else v
+    if is_tw and v > 0.2:
+        return v / 100
+    return v
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_info(code_full: str) -> dict:
@@ -110,13 +117,13 @@ def is_etf(info: dict, code_base: str) -> bool:
     qt = (info.get('quoteType') or '').upper()
     return qt == 'ETF' or code_base in ETF_CODES
 
-def calc_etf_score(info: dict):
+def calc_etf_score(info: dict, is_tw: bool = True):
     """ETF 專屬評分（0–100）：費用率(30) + 殖利率(30) + 3年報酬(25) + 規模(15)"""
     detail = {}
     total  = 0
 
     exp_r   = info.get('annualReportExpenseRatio') or info.get('expenseRatio')
-    div_y   = normalize_yield(info.get('dividendYield') or info.get('yield'))
+    div_y   = normalize_yield(info.get('dividendYield') or info.get('yield'), is_tw=is_tw)
     ret_3yr = info.get('threeYearAverageReturn')
     ret_1yr = info.get('oneYearTotalReturn') or info.get('ytdReturn')
     assets  = info.get('totalAssets')
@@ -224,7 +231,8 @@ def classify_lynch(info: dict, code_base: str) -> str:
     rev_g    = info.get('revenueGrowth')
     sector   = info.get('sector', '') or ''
     industry = info.get('industry', '') or ''
-    div_y    = normalize_yield(info.get('dividendYield') or 0) or 0
+    is_tw_c  = not is_us_stock(code_base)
+    div_y    = normalize_yield(info.get('dividendYield') or 0, is_tw=is_tw_c) or 0
 
     for kw in CYCLICAL_SECTORS:
         if kw in sector or kw in industry:
@@ -418,9 +426,9 @@ with tab1:
     col_inp, col_btn = st.columns([3, 1])
     with col_inp:
         code_raw = st.text_input(
-            "股票代號（台股）:",
+            "股票代號（台股/美股）:",
             value="2330",
-            placeholder="例：2330、2886、00878、0050",
+            placeholder="台股：2330、0056；美股：VOO、VT、TSM",
             label_visibility="collapsed"
         )
     with col_btn:
@@ -443,7 +451,8 @@ with tab1:
         cat_nm, cat_desc = LYNCH_CAT[cat_key]
         is_etf_ = (cat_key == 'etf')
         score, detail, peg = calc_score(info, code_base)
-        etf_score, etf_detail = calc_etf_score(info) if is_etf_ else (None, {})
+        is_tw_stock_ = not is_us_stock(code_base)
+        etf_score, etf_detail = calc_etf_score(info, is_tw=is_tw_stock_) if is_etf_ else (None, {})
 
         if is_etf_:
             stars, grade_text = grade_etf(etf_score)
@@ -465,7 +474,7 @@ with tab1:
         pe    = info.get('trailingPE')
         eps_g = info.get('earningsGrowth')
         rev_g = info.get('revenueGrowth')
-        div_y = normalize_yield(info.get('dividendYield'))
+        div_y = normalize_yield(info.get('dividendYield'), is_tw=is_tw_stock_)
 
         if is_etf_:
             exp_r   = info.get('annualReportExpenseRatio') or info.get('expenseRatio')
@@ -555,10 +564,10 @@ with tab2:
 
     # ── 互動式表格輸入 ──────────────────────────────
     default_df = pd.DataFrame([
-        {"股票代號": "2330", "持股張數": 3,   "平均成本(元)": 1580.0},
-        {"股票代號": "0056", "持股張數": 212, "平均成本(元)": 31.0},
-        {"股票代號": "00878","持股張數": 222, "平均成本(元)": 19.1},
-        {"股票代號": "2886", "持股張數": 11,  "平均成本(元)": 26.5},
+        {"股票代號": "2330", "持股股數": 3000,   "平均成本(元)": 1580.0},
+        {"股票代號": "0056", "持股股數": 212000, "平均成本(元)": 31.0},
+        {"股票代號": "00878","持股股數": 222000, "平均成本(元)": 19.1},
+        {"股票代號": "2886", "持股股數": 11000,  "平均成本(元)": 26.5},
     ])
 
     edited_df = st.data_editor(
@@ -567,13 +576,13 @@ with tab2:
         use_container_width=True,
         column_config={
             "股票代號": st.column_config.TextColumn(
-                "股票代號", help="台股代號，例：2330、0056、00878", width="small"
+                "股票代號", help="台股：2330、0056；美股：VOO、VT、TSM", width="small"
             ),
-            "持股張數": st.column_config.NumberColumn(
-                "持股張數（張）", help="1張 = 1000股", min_value=0, step=1, width="small"
+            "持股股數": st.column_config.NumberColumn(
+                "持股股數（股）", help="直接輸入股數（台股1張=1000股）", min_value=0, step=1, width="small"
             ),
             "平均成本(元)": st.column_config.NumberColumn(
-                "平均成本（元）", help="每股平均買入成本，可留空", min_value=0, step=0.1, width="small"
+                "平均成本（元/股）", help="每股平均買入成本，可留空", min_value=0, step=0.1, width="small"
             ),
         },
         hide_index=True,
@@ -590,7 +599,7 @@ with tab2:
             if not code_r:
                 continue
             try:
-                boards = float(row.get("持股張數") or 1)
+                boards = float(row.get("持股股數") or 1)
             except Exception:
                 boards = 1
             try:
@@ -621,14 +630,15 @@ with tab2:
             is_etf_h = (cat_k == 'etf')
             sc, det, pg = calc_score(info_, code_b)
 
+            is_tw_h = not is_us_stock(code_b)
             if is_etf_h:
-                etf_sc, _ = calc_etf_score(info_)
+                etf_sc, _ = calc_etf_score(info_, is_tw=is_tw_h)
                 st_stars, _ = grade_etf(etf_sc)
                 sc = etf_sc
             else:
                 st_stars, _ = grade(sc) if sc is not None else ('⭐', '')
 
-            shares_count = h['boards'] * 1000
+            shares_count = h['boards']   # 直接輸入股數（台股/美股統一用股）
             cost_total   = (h['cost'] * shares_count) if h['cost'] else None
             val_total    = (price_ * shares_count) if price_ else None
             pnl_         = (val_total - cost_total) if (val_total and cost_total) else None
@@ -759,8 +769,8 @@ with tab2:
 
         st.markdown("---")
         st.write("> *「股票市場是把錢從急躁者的口袋，轉移到有耐心者的口袋。」 — 彼得林區*")
-        st.markdown("**林區投資核心原則：**")
+        st.markdown("林區投資核心原則：")
         st.write("1. **了解你買的每一支股票**：說得出公司如何賺錢，才有資格持有。")
         st.write("2. **PEG < 1 是最好的起點**：成長快、股價合理，才是林區的最愛。")
         st.write("3. **不要因為股價下跌就賣**：如果基本面沒壞，跌是加碼機會。")
-        st.write("4. **長期持有才能讓複利發揮**：林區的 Magellan 基金年均報酬 29%，靠的是持有，不是頻繁交易。")
+        st.write("4. **長期持有才能讓複利發挥**：林區的 Magellan 基金年均報酬 29%，靠的是持有，不是頻繁交易。")
