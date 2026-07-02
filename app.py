@@ -1,191 +1,670 @@
+"""
+📚 彼得林區台股選股系統 — lynch.py
+啟動：streamlit run lynch.py
+"""
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-from datetime import datetime
+import numpy as np
+import plotly.graph_objects as go
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import datetime
 
-# --- 頁面設定 ---
-st.set_page_config(page_title="楚狂人策略-批量掃描神器", layout="wide")
-
-# --- 側邊欄：設定股票清單 ---
-st.sidebar.title("🔍 掃描設定")
-st.sidebar.write("輸入股票代號 (用逗號分隔):")
-st.sidebar.caption("💡 提示：台股直接輸入數字即可 (如 2330)，美股輸入代號 (如 AAPL)。")
-
-# 預設清單 (改為純數字，不需 .TW)
-default_tickers = "2330, 2454, 2317, 0050, 0056, 00878, 00919, 00713, 2303, 2603"
-user_input = st.sidebar.text_area("股票清單", value=default_tickers, height=150)
-
-scan_button = st.sidebar.button("🚀 開始掃描", type="primary")
-
-st.sidebar.markdown("---")
-st.sidebar.info(
-    """
-    **分類邏輯說明：**
-    
-    1. **🚨 潛在買點 (Day 1)**
-       - 昨日收盤 < 月線
-       - 目前價格 > 月線
-       - *建議：等待隔日中午確認*
-       
-    2. **⚠️ 潛在賣點 (Day 1)**
-       - 昨日收盤 > 月線
-       - 目前價格 < 月線
-       - *建議：等待隔日中午確認*
-       
-    3. **✅ 多頭趨勢**
-       - 連續兩日都在月線上
-       
-    4. **🔻 空頭趨勢**
-       - 連續兩日都在月線下
-    """
+st.set_page_config(
+    page_title="📚 彼得林區台股系統",
+    layout="wide",
+    page_icon="📚"
 )
 
-# --- 核心函數 ---
-def process_ticker(ticker_input):
-    """
-    自動處理代號後綴
-    1. 去除空白
-    2. 如果是純數字 (如 2330) -> 自動加上 .TW
-    3. 如果已有後綴或為美股 -> 維持原樣
-    """
-    clean_ticker = ticker_input.strip().upper()
-    if clean_ticker.isdigit():
-        return f"{clean_ticker}.TW"
-    return clean_ticker
+# ══════════════════════════════════════════════════
+# 1. 常數與設定
+# ══════════════════════════════════════════════════
 
-def get_strategy_status(ticker):
+# 台股 ETF 清單（不適用個股評分）
+ETF_CODES = {
+    '0050','0056','00878','00919','00881','006208',
+    '00757','00675L','00631L','00713','00929','00981A',
+    '00692','00850','00896','00900','00905','00912',
+}
+
+# 林區 6 大分類
+LYNCH_CAT = {
+    'fast':      ('🚀 快速成長股', '林區最愛！年成長 > 15%，PEG < 1 是絕佳機會。'),
+    'stalwart':  ('📈 穩定成長股', '大型穩健，適合長期持有。留意不要付太高 P/E。'),
+    'slow':      ('🐢 緩慢成長股', '成熟產業、高股息。重點看股息率，而非成長。'),
+    'cyclical':  ('🔄 景氣循環股', '隨景氣起伏。低谷買進，高峰前出場，時機最重要。'),
+    'turnaround':('🔁 轉機股',     '曾陷困境正在復甦。高風險高報酬，需深入了解原因。'),
+    'asset':     ('🏦 資產股',     '帳面資產被低估。需自行評估土地、持股等隱藏價值。'),
+    'etf':       ('📦 ETF／指數基金','分散工具，適合定期定額長期持有，林區建議不挑個股者優先選擇。'),
+}
+
+# 台灣景氣循環類股（部分）
+CYCLICAL_SECTORS = {'半導體', '航運', '鋼鐵', '塑化', '紙類', '建材營造', 'Semiconductors', 'Steel', 'Shipping'}
+
+# ══════════════════════════════════════════════════
+# 2. 工具函式
+# ══════════════════════════════════════════════════
+
+def normalize(code: str) -> str:
+    code = code.strip().upper()
+    if '.' not in code:
+        code += '.TW'
+    return code
+
+def fmt_price(v):
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return 'N/A'
+    return f"{v:,.0f}" if v >= 100 else f"{v:.2f}"
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_info(code_full: str) -> dict:
+    """抓取 yfinance info + 補算 EPS 成長"""
     try:
-        # 下載資料
-        df = yf.download(ticker, period="3mo", progress=False)
-        
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        
-        if len(df) < 20:
-            return None # 資料不足
+        t = yf.Ticker(code_full)
+        info = dict(t.info or {})
 
-        # 計算 MA20
-        df['MA20'] = df['Close'].rolling(window=20).mean()
-        
-        # 取最後兩筆資料
-        last_row = df.iloc[-1]      # 最新 (Today)
-        prev_row = df.iloc[-2]      # 昨日 (Yesterday)
-        
-        # 數據提取
-        price_now = last_row['Close']
-        ma20_now = last_row['MA20']
-        price_prev = prev_row['Close']
-        ma20_prev = prev_row['MA20']
+        # 若 earningsGrowth 缺失，嘗試從財報手動計算
+        if not info.get('earningsGrowth'):
+            try:
+                fin = t.financials
+                if fin is not None and not fin.empty:
+                    ni_row = None
+                    for key in ['Net Income', 'Net Income Common Stockholders']:
+                        if key in fin.index:
+                            ni_row = fin.loc[key].dropna()
+                            break
+                    if ni_row is not None and len(ni_row) >= 2:
+                        base = ni_row.iloc[1]
+                        if base and base != 0:
+                            info['earningsGrowth'] = (ni_row.iloc[0] - base) / abs(base)
+            except Exception:
+                pass
 
-        # 狀態判斷
-        is_now_above = price_now > ma20_now
-        is_prev_above = price_prev > ma20_prev
-        
-        status = ""
-        category = "" 
-        
-        if is_now_above and not is_prev_above:
-            status = "🚨 突破月線 (Day 1) - 待確認"
-            category = "1_Buy_Watch"
-        elif not is_now_above and is_prev_above:
-            status = "⚠️ 跌破月線 (Day 1) - 待確認"
-            category = "2_Sell_Watch"
-        elif is_now_above and is_prev_above:
-            status = "✅ 多頭趨勢 - 續抱"
-            category = "3_Bullish"
+        return info
+    except Exception:
+        return {}
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_price(code_full: str):
+    try:
+        hist = yf.Ticker(code_full).history(period='2d')
+        if not hist.empty:
+            return float(hist['Close'].iloc[-1])
+    except Exception:
+        pass
+    return None
+
+# ══════════════════════════════════════════════════
+# 3. 林區分類 & 評分引擎
+# ══════════════════════════════════════════════════
+
+def classify_lynch(info: dict, code_base: str) -> str:
+    if code_base in ETF_CODES:
+        return 'etf'
+
+    eps_g   = info.get('earningsGrowth')
+    rev_g   = info.get('revenueGrowth')
+    sector  = info.get('sector', '') or ''
+    industry= info.get('industry', '') or ''
+    div_y   = info.get('dividendYield', 0) or 0
+
+    # 景氣循環
+    for kw in CYCLICAL_SECTORS:
+        if kw in sector or kw in industry:
+            return 'cyclical'
+
+    # 快速成長：EPS 或營收 > 15%
+    if (eps_g and eps_g > 0.15) or (rev_g and rev_g > 0.15):
+        return 'fast'
+
+    # 緩慢成長：成長 < 5% 且高股息
+    if eps_g is not None and eps_g < 0.05 and div_y > 0.03:
+        return 'slow'
+
+    # 轉機：獲利負成長但幅度縮小（簡化判斷）
+    if eps_g is not None and -0.4 < eps_g < 0:
+        return 'turnaround'
+
+    # 穩定成長：其餘
+    return 'stalwart'
+
+
+def calc_score(info: dict, code_base: str):
+    """
+    回傳 (總分 int|None, 明細 dict, peg float|None)
+    ETF 回傳 (None, {}, None)
+    """
+    if code_base in ETF_CODES:
+        return None, {}, None
+
+    detail = {}
+    total  = 0
+
+    pe       = info.get('trailingPE')
+    eps_g    = info.get('earningsGrowth')
+    rev_g    = info.get('revenueGrowth')
+    debt_eq  = info.get('debtToEquity')       # yfinance 單位：百分比（50 = 50%）
+    cash     = info.get('totalCash')
+    debt     = info.get('totalDebt')
+
+    # ── 1. PEG 比率（35 分）★ 林區核心指標 ★ ──────
+    peg = None
+    peg_score = 0
+    if pe and eps_g and eps_g > 0:
+        peg = pe / (eps_g * 100)
+        if   peg <= 0.5:  peg_score = 35
+        elif peg <= 0.75: peg_score = 28
+        elif peg <= 1.0:  peg_score = 20
+        elif peg <= 1.5:  peg_score = 10
+    detail['PEG 比率'] = {
+        'val': f"{peg:.2f}" if peg else 'N/A',
+        'score': peg_score, 'max': 35,
+        'note': 'PEG < 1 = 低估、< 0.5 = 超值'
+    }
+    total += peg_score
+
+    # ── 2. EPS 年成長率（25 分）──────────────────
+    eps_score = 0
+    if eps_g is not None:
+        g = eps_g * 100
+        if   g > 25: eps_score = 25
+        elif g > 15: eps_score = 20
+        elif g > 10: eps_score = 15
+        elif g >  5: eps_score = 8
+    detail['EPS 年成長率'] = {
+        'val': f"{eps_g*100:.1f}%" if eps_g is not None else 'N/A',
+        'score': eps_score, 'max': 25,
+        'note': '林區偏好 > 15% 的高成長'
+    }
+    total += eps_score
+
+    # ── 3. 負債比（20 分）────────────────────────
+    debt_score = 0
+    if debt_eq is not None:
+        d = debt_eq / 100   # 轉回小數
+        if   d < 0.25: debt_score = 20
+        elif d < 0.50: debt_score = 15
+        elif d < 1.00: debt_score = 8
+    detail['負債／股東權益'] = {
+        'val': f"{debt_eq:.0f}%" if debt_eq is not None else 'N/A',
+        'score': debt_score, 'max': 20,
+        'note': '越低越安全，林區偏好低負債公司'
+    }
+    total += debt_score
+
+    # ── 4. 現金覆蓋率（10 分）───────────────────
+    cash_score = 0
+    if cash and debt:
+        ratio = cash / debt
+        if   ratio >= 1.0: cash_score = 10
+        elif ratio >= 0.5: cash_score = 5
+    elif cash and not debt:
+        cash_score = 10   # 無負債
+    cash_str = 'N/A'
+    if cash and debt and debt > 0:
+        cash_str = f"{cash/debt:.0%}"
+    elif cash and not debt:
+        cash_str = '無負債'
+    detail['現金覆蓋負債'] = {
+        'val': cash_str,
+        'score': cash_score, 'max': 10,
+        'note': '現金 > 負債 = 財務安全邊際高'
+    }
+    total += cash_score
+
+    # ── 5. 營收年成長（10 分）───────────────────
+    rev_score = 0
+    if rev_g is not None:
+        g = rev_g * 100
+        if   g > 15: rev_score = 10
+        elif g >  5: rev_score = 7
+        elif g >  0: rev_score = 3
+    detail['營收年成長率'] = {
+        'val': f"{rev_g*100:.1f}%" if rev_g is not None else 'N/A',
+        'score': rev_score, 'max': 10,
+        'note': '成長動能持續性'
+    }
+    total += rev_score
+
+    return total, detail, peg
+
+
+def grade(score):
+    """(星星, 文字說明)"""
+    if score >= 80: return '⭐⭐⭐⭐⭐', '林區強力推薦'
+    if score >= 65: return '⭐⭐⭐⭐',   '符合林區標準'
+    if score >= 50: return '⭐⭐⭐',     '部分符合，持續觀察'
+    if score >= 35: return '⭐⭐',       '偏弱，謹慎持有'
+    return               '⭐',          '不符合林區標準'
+
+
+def action(score, pnl_pct=None):
+    if score is None:
+        return '📦 ETF：定期定額，長期持有'
+    if score >= 65:
+        if pnl_pct is not None and pnl_pct < -10:
+            return '💎 基本面佳 × 跌深：逢低加碼好時機'
+        return '✅ 基本面健康，繼續持有 / 可考慮加碼'
+    if score >= 50:
+        return '👀 基本面普通，持有觀察，勿輕易加碼'
+    if score >= 35:
+        return '⚠️ 基本面轉弱，考慮減碼或設停損'
+    return '🚪 不符林區標準，建議重新審視持倉理由'
+
+
+def lynch_voice(info, score, peg, cat_key):
+    """模擬林區會說的話（一段評語）"""
+    lines = []
+    eps_g   = info.get('earningsGrowth')
+    rev_g   = info.get('revenueGrowth')
+    debt_eq = info.get('debtToEquity')
+    pe      = info.get('trailingPE')
+    cash    = info.get('totalCash')
+    debt    = info.get('totalDebt')
+
+    if peg:
+        if peg < 0.5:
+            lines.append(f"🔥 PEG 只有 **{peg:.2f}**！這正是我最愛找的機會——股價嚴重低估公司的成長速度。")
+        elif peg < 1.0:
+            lines.append(f"✅ PEG = **{peg:.2f}**，低於 1，代表股價尚未完全反映成長潛力，值得關注。")
+        elif peg < 1.5:
+            lines.append(f"⚠️ PEG = **{peg:.2f}**，略偏高。我會希望再等等，看能否在更低價格買到。")
         else:
-            status = "🔻 空頭趨勢 - 觀望"
-            category = "4_Bearish"
-
-        # 計算乖離率
-        bias = ((price_now - ma20_now) / ma20_now) * 100
-
-        # 顯示用的代號 (拿掉 .TW 讓版面比較乾淨，除非是美股)
-        display_ticker = ticker.replace(".TW", "")
-
-        return {
-            "代號": display_ticker,
-            "現價": round(price_now, 2),
-            "月線(20MA)": round(ma20_now, 2),
-            "乖離率(%)": round(bias, 2),
-            "狀態": status,
-            "Category": category
-        }
-
-    except Exception as e:
-        return None
-
-# --- 主程式 ---
-st.title("📊 楚狂人月線策略 - 批量掃描儀表板")
-st.write("此工具依照「月線 (20MA) 與延遲確認策略」自動掃描您的關注清單。")
-
-if scan_button:
-    # 處理輸入清單 (加入自動後綴邏輯)
-    raw_list = user_input.split(",")
-    results = []
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    total_stocks = len(raw_list)
-    
-    for i, raw_t in enumerate(raw_list):
-        if not raw_t.strip(): continue # 跳過空白
-        
-        # 自動轉換代號
-        ticker = process_ticker(raw_t)
-        
-        status_text.text(f"正在分析: {ticker} ...")
-        res = get_strategy_status(ticker)
-        if res:
-            results.append(res)
-        
-        progress_bar.progress((i + 1) / total_stocks)
-    
-    status_text.text("掃描完成！")
-    progress_bar.empty()
-    
-    # 顯示結果
-    if results:
-        df_res = pd.DataFrame(results)
-        
-        # --- 分組顯示 ---
-        
-        # 1. 潛在機會
-        buy_watch = df_res[df_res['Category'] == "1_Buy_Watch"]
-        if not buy_watch.empty:
-            st.subheader("🚨 觀察名單：剛突破月線 (Day 1)")
-            st.markdown("💡 **策略**：今日不動作，若 **明日中午 12:00** 價格仍 > 月線，則進場。")
-            st.dataframe(buy_watch.drop(columns=['Category']), use_container_width=True)
-        else:
-            st.info("目前沒有「剛突破月線」的股票。")
-            
-        st.markdown("---")
-
-        # 2. 風險警示
-        sell_watch = df_res[df_res['Category'] == "2_Sell_Watch"]
-        if not sell_watch.empty:
-            st.subheader("⚠️ 警戒名單：剛跌破月線 (Day 1)")
-            st.markdown("💡 **策略**：今日不動作，若 **明日中午 12:00** 價格仍 < 月線，則出場。")
-            st.dataframe(sell_watch.drop(columns=['Category']), use_container_width=True)
-        
-        st.markdown("---")
-        
-        # 3. 多空一覽
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("✅ 多頭排列 (安心區)")
-            bullish = df_res[df_res['Category'] == "3_Bullish"]
-            st.dataframe(bullish.drop(columns=['Category']), use_container_width=True)
-            
-        with col2:
-            st.subheader("🔻 空頭排列 (觀望區)")
-            bearish = df_res[df_res['Category'] == "4_Bearish"]
-            st.dataframe(bearish.drop(columns=['Category']), use_container_width=True)
-
+            lines.append(f"❌ PEG = **{peg:.2f}**，成長速度已跟不上股價，我不會在這個位置進場。")
     else:
-        st.error("查無數據，請確認股票代號是否正確。")
+        lines.append("⚠️ PEG 無法計算（缺少 EPS 成長數據），這讓我很難判斷合理價值。先去找財報確認。")
 
-else:
-    st.write("👈 請在左側輸入股票代號（例如：2330, 0050），並點擊「開始掃描」。")
+    if eps_g is not None:
+        if eps_g > 0.2:
+            lines.append(f"📈 EPS 年成長 **{eps_g*100:.0f}%**，這種成長動能如果能維持 3～5 年，股價必然反映。")
+        elif eps_g > 0.1:
+            lines.append(f"📊 EPS 年成長 **{eps_g*100:.0f}%**，穩健但不算亮眼，適合「穩定成長股」邏輯。")
+        elif eps_g < 0:
+            lines.append(f"⚠️ EPS 負成長 **{eps_g*100:.0f}%**，先搞清楚是一次性因素還是長期惡化。")
+
+    if debt_eq is not None:
+        if debt_eq < 25:
+            lines.append(f"💪 負債比只有 **{debt_eq:.0f}%**，財務非常穩健。景氣轉差也撐得住。")
+        elif debt_eq > 100:
+            lines.append(f"❗ 負債比高達 **{debt_eq:.0f}%**，這讓我擔心。利率上升或景氣收縮時，高負債公司最危險。")
+
+    if cash and debt and debt > 0:
+        ratio = cash / debt
+        if ratio >= 1:
+            lines.append(f"✅ 現金足以覆蓋所有負債（{ratio:.0%}），這是我愛看到的「現金防護網」。")
+
+    if cat_key == 'fast':
+        lines.append("🚀 這是一支快速成長股——林區最愛的類型。只要成長持續、PEG 合理，我願意長期持有。")
+    elif cat_key == 'slow':
+        lines.append("🐢 緩慢成長股的重點是股息，而不是資本利得。如果股息穩定、負債低，也是不錯的選擇。")
+    elif cat_key == 'cyclical':
+        lines.append("🔄 景氣循環股最重要的不是 PEG，而是**買在哪個景氣位置**。低谷才是進場時機。")
+    elif cat_key == 'turnaround':
+        lines.append("🔁 轉機股的關鍵問題：**為什麼它會好轉？** 搞清楚復甦原因，才能確認這不是陷阱。")
+
+    if not lines:
+        lines.append("⚠️ 基本面數據不足，無法做完整評估。林區說：「不了解就不要買。」先去看財報！")
+
+    return lines
+
+# ══════════════════════════════════════════════════
+# 4. UI — 頁首
+# ══════════════════════════════════════════════════
+
+st.title("📚 彼得林區台股選股系統")
+st.markdown(
+    "> *「真正傷害投資人的，不是市場下跌，而是在錯誤的股票上等待。"
+    "找到你了解的好公司，在合理價格買進，然後持有。」— 彼得林區*"
+)
+st.markdown("---")
+
+tab1, tab2 = st.tabs(["🔍 個股林區評分", "💼 持股體檢"])
+
+# ══════════════════════════════════════════════════
+# 5. Tab 1：個股評分
+# ══════════════════════════════════════════════════
+
+with tab1:
+    col_inp, col_btn = st.columns([3, 1])
+    with col_inp:
+        code_raw = st.text_input(
+            "股票代號（台股）:",
+            value="2330",
+            placeholder="例：2330、2886、00878、0050",
+            label_visibility="collapsed"
+        )
+    with col_btn:
+        btn1 = st.button("🔍 林區分析", type="primary", use_container_width=True)
+
+    if btn1:
+        code_base = code_raw.strip().upper()
+        code_full = normalize(code_raw)
+
+        with st.spinner(f"分析 {code_full} 中..."):
+            info  = fetch_info(code_full)
+            price = fetch_price(code_full)
+
+        if not info and price is None:
+            st.error("❌ 無法取得資料，請確認股票代號是否正確（例：2330、00878）")
+            st.stop()
+
+        name    = (info.get('longName') or info.get('shortName') or code_base)
+        cat_key = classify_lynch(info, code_base)
+        cat_nm, cat_desc = LYNCH_CAT[cat_key]
+        score, detail, peg = calc_score(info, code_base)
+        stars, grade_text  = grade(score) if score is not None else ('📦', 'ETF')
+
+        # ── 標題列 ──────────────────────────────────
+        st.subheader(f"{name}　{code_base}")
+        c_cat, c_act = st.columns([1, 2])
+        with c_cat:
+            st.info(f"**{cat_nm}**\n\n{cat_desc}")
+        with c_act:
+            if score is not None:
+                st.metric("林區評分", f"{score} / 100", grade_text)
+            else:
+                st.info("ETF 不適用個股林區評分")
+
+        st.markdown("---")
+
+        # ── KPI 列 ──────────────────────────────────
+        pe    = info.get('trailingPE')
+        eps_g = info.get('earningsGrowth')
+        rev_g = info.get('revenueGrowth')
+        div_y = info.get('dividendYield')
+
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("目前股價",   f"${fmt_price(price)}" if price else 'N/A')
+        m2.metric("本益比 P/E", f"{pe:.1f}" if pe else 'N/A')
+        m3.metric("EPS 成長",   f"{eps_g*100:.1f}%" if eps_g else 'N/A')
+        m4.metric("PEG 比率",   f"{peg:.2f}" if peg else 'N/A',
+                  delta="✅ 低估" if (peg and peg < 1) else ("⚠️ 偏高" if (peg and peg > 1.5) else None),
+                  delta_color="normal" if (peg and peg < 1) else "inverse")
+        m5.metric("營收成長",   f"{rev_g*100:.1f}%" if rev_g else 'N/A')
+        m6.metric("股息殖利率", f"{div_y*100:.2f}%" if div_y else 'N/A')
+
+        # ── 評分明細 ────────────────────────────────
+        if score is not None:
+            st.markdown("### 📊 林區評分明細")
+
+            # 雷達圖
+            cats_r  = [d for d in detail]
+            vals_r  = [detail[d]['score'] / detail[d]['max'] * 100 for d in detail]
+            fig_r = go.Figure(go.Scatterpolar(
+                r=vals_r + [vals_r[0]],
+                theta=cats_r + [cats_r[0]],
+                fill='toself',
+                fillcolor='rgba(255,215,0,0.15)',
+                line=dict(color='#F59E0B', width=2),
+                name='林區評分'
+            ))
+            fig_r.update_layout(
+                polar=dict(
+                    radialaxis=dict(visible=True, range=[0, 100], tickfont=dict(size=10)),
+                    angularaxis=dict(tickfont=dict(size=12))
+                ),
+                template='plotly_dark',
+                showlegend=False,
+                height=350,
+                margin=dict(t=30, b=30, l=50, r=50)
+            )
+            st.plotly_chart(fig_r, use_container_width=True)
+
+            # 各項明細條
+            for metric, d in detail.items():
+                colA, colB, colC, colD = st.columns([2.5, 4, 1, 1.5])
+                with colA:
+                    st.write(f"**{metric}**")
+                    st.caption(d['note'])
+                with colB:
+                    pct = d['score'] / d['max'] if d['max'] else 0
+                    color = "🟢" if pct >= 0.7 else ("🟡" if pct >= 0.4 else "🔴")
+                    st.progress(pct, text=f"{color}")
+                with colC:
+                    st.write(f"**{d['score']}/{d['max']}**")
+                with colD:
+                    st.write(d['val'])
+
+            st.markdown(f"### 💡 建議：{action(score)}")
+
+            # ── 林區怎麼說 ──────────────────────────
+            st.markdown("---")
+            st.markdown("### 💬 如果彼得林區持有這支股票，他會說⋯")
+            for line in lynch_voice(info, score, peg, cat_key):
+                st.write(line)
+
+        else:
+            # ETF 頁面
+            st.markdown("### 📦 ETF 評估重點")
+            exp_r = info.get('annualReportExpenseRatio') or info.get('expenseRatio')
+            col_e1, col_e2, col_e3 = st.columns(3)
+            col_e1.metric("股息殖利率", f"{div_y*100:.2f}%" if div_y else 'N/A')
+            col_e2.metric("費用率",     f"{exp_r*100:.2f}%" if exp_r else 'N/A')
+            col_e3.metric("目前價格",   f"${fmt_price(price)}" if price else 'N/A')
+
+            st.info("""
+**林區對 ETF 的建議：**
+
+> 「如果你不想花時間研究個股，買廣泛市場的指數 ETF 是非常聰明的決定。
+> 大多數主動型基金經理人長期都跑輸指數。」
+
+**ETF 評估重點（林區邏輯）：**
+- 殖利率是否穩定？
+- 費用率夠低嗎？（建議 < 0.3%）
+- 追蹤標的是否分散？
+- 定期定額、長期持有是王道
+            """)
+
+# ══════════════════════════════════════════════════
+# 6. Tab 2：持股體檢
+# ══════════════════════════════════════════════════
+
+with tab2:
+    st.subheader("💼 持股體檢")
+    st.caption("輸入你的持股，系統用彼得林區標準逐一評估，給出留 / 觀察 / 減碼建議。")
+
+    with st.expander("📝 輸入持股清單", expanded=True):
+        st.caption("格式：股票代號, 持股張數, 平均成本（每行一支，成本可不填）")
+        default_txt = (
+            "2330, 1, 900\n"
+            "0056, 5, 35\n"
+            "00878, 10, 20\n"
+            "2886, 2, 42\n"
+        )
+        port_text = st.text_area("持股清單:", value=default_txt, height=160, label_visibility="collapsed")
+        btn2 = st.button("🔍 開始體檢", type="primary")
+
+    if btn2:
+        # 解析輸入
+        holdings = []
+        for line in port_text.strip().splitlines():
+            parts = [p.strip() for p in line.split(',')]
+            if not parts or not parts[0]:
+                continue
+            code_r  = parts[0].strip()
+            boards  = float(parts[1].replace(',', '')) if len(parts) > 1 and parts[1].strip() else 1
+            cost_pp = float(parts[2].replace(',', '')) if len(parts) > 2 and parts[2].strip() else None
+            holdings.append({'code': code_r, 'boards': boards, 'cost': cost_pp})
+
+        if not holdings:
+            st.error("請輸入至少一支持股")
+            st.stop()
+
+        progress_bar = st.progress(0, text="體檢中...")
+
+        def check_one(h):
+            code_b = h['code'].strip().upper()
+            code_f = normalize(h['code'])
+            info_  = fetch_info(code_f)
+            price_ = fetch_price(code_f)
+
+            name_ = info_.get('longName') or info_.get('shortName') or code_b
+            # 截短名稱
+            if len(name_) > 12:
+                name_ = name_[:10] + '…'
+
+            cat_k = classify_lynch(info_, code_b)
+            cat_n, _ = LYNCH_CAT[cat_k]
+            sc, det, pg = calc_score(info_, code_b)
+            st_stars, _ = grade(sc) if sc is not None else ('📦', '')
+
+            # 損益計算（1張 = 1000股）
+            shares_count = h['boards'] * 1000
+            cost_total   = (h['cost'] * shares_count) if h['cost'] else None
+            val_total    = (price_ * shares_count) if price_ else None
+            pnl_         = (val_total - cost_total) if (val_total and cost_total) else None
+            pnl_pct_     = ((price_ - h['cost']) / h['cost'] * 100) if (price_ and h['cost']) else None
+
+            pe_   = info_.get('trailingPE')
+            eps_g_= info_.get('earningsGrowth')
+
+            return {
+                '代號':       code_b,
+                '名稱':       name_,
+                '林區分類':   cat_n,
+                '現價':       f"${fmt_price(price_)}" if price_ else 'N/A',
+                '成本/股':    f"${h['cost']:,.0f}" if h['cost'] else '—',
+                '損益%':      f"{pnl_pct_:+.1f}%" if pnl_pct_ is not None else '—',
+                '未實現損益': f"${pnl_:+,.0f}" if pnl_ is not None else '—',
+                'P/E':        f"{pe_:.1f}" if pe_ else 'N/A',
+                'EPS成長':    f"{eps_g_*100:.0f}%" if eps_g_ else 'N/A',
+                'PEG':        f"{pg:.2f}" if pg else 'N/A',
+                '林區分數':   sc if sc is not None else 'ETF',
+                '評級':       st_stars,
+                '林區建議':   action(sc, pnl_pct_),
+                # 排序用
+                '_score':     sc or 0,
+                '_cost':      cost_total or 0,
+                '_val':       val_total or 0,
+                '_pnl':       pnl_ or 0,
+                '_pnl_pct':   pnl_pct_,
+            }
+
+        results = []
+        done_count = 0
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futs = {pool.submit(check_one, h): h for h in holdings}
+            for fut in as_completed(futs):
+                res = fut.result()
+                if res:
+                    results.append(res)
+                done_count += 1
+                progress_bar.progress(done_count / len(holdings), text=f"體檢中... {done_count}/{len(holdings)}")
+
+        progress_bar.empty()
+
+        if not results:
+            st.error("無法取得任何資料")
+            st.stop()
+
+        # 依評分排序（高分在前）
+        results.sort(key=lambda x: x['_score'], reverse=True)
+
+        # ── 結果表格 ────────────────────────────────
+        st.markdown("### 📋 持股評分總表")
+        disp_cols = ['代號','名稱','林區分類','現價','成本/股','損益%','未實現損益',
+                     'P/E','EPS成長','PEG','林區分數','評級','林區建議']
+        df_show = pd.DataFrame(results)[disp_cols]
+        st.dataframe(df_show, use_container_width=True, hide_index=True)
+
+        # ── 投資組合總覽 ────────────────────────────
+        st.markdown("---")
+        st.markdown("### 📊 投資組合總覽")
+
+        total_cost = sum(r['_cost'] for r in results if r['_cost'])
+        total_val  = sum(r['_val']  for r in results if r['_val'])
+        total_pnl  = total_val - total_cost if (total_val and total_cost) else None
+        pnl_pct_all = total_pnl / total_cost * 100 if (total_pnl and total_cost) else None
+
+        num_scores  = [r['_score'] for r in results if isinstance(r['_score'], (int, float)) and r['_score'] > 0]
+        avg_score   = np.mean(num_scores) if num_scores else None
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("總投入成本",       f"${total_cost:,.0f}" if total_cost else '—')
+        c2.metric("目前市值",         f"${total_val:,.0f}"  if total_val  else '—')
+        c3.metric("未實現損益",
+                  f"${total_pnl:+,.0f}" if total_pnl else '—',
+                  f"{pnl_pct_all:+.1f}%" if pnl_pct_all else None)
+        c4.metric("投組林區均分",     f"{avg_score:.0f}/100" if avg_score else '—')
+
+        # ── 林區給整組合的評語 ──────────────────────
+        st.markdown("---")
+        st.markdown("### 💬 彼得林區看你的投資組合")
+
+        gems     = [r for r in results if isinstance(r['_score'], int) and r['_score'] >= 65]
+        weak     = [r for r in results if isinstance(r['_score'], int) and r['_score'] < 50]
+        etfs     = [r for r in results if r['林區分數'] == 'ETF']
+        dip_opp  = [r for r in results if isinstance(r['_score'], int) and r['_score'] >= 65
+                    and r['_pnl_pct'] is not None and r['_pnl_pct'] < -8]
+
+        if gems:
+            st.success(
+                f"✅ **{', '.join(r['代號'] for r in gems)}** "
+                "基本面符合林區標準，這些是你組合的核心。繼續持有，有機會加碼。"
+            )
+        if dip_opp:
+            st.info(
+                f"💎 **{', '.join(r['代號'] for r in dip_opp)}** "
+                "基本面佳但跌幅超過 8%。林區說：『好公司跌價只是給你更好的買進機會。』"
+            )
+        if weak:
+            st.warning(
+                f"⚠️ **{', '.join(r['代號'] for r in weak)}** "
+                "基本面評分偏低。林區建議：先問自己「我為什麼要持有它？」如果答不出來，就該考慮出場。"
+            )
+        if etfs:
+            st.info(
+                f"📦 **{', '.join(r['代號'] for r in etfs)}** 是 ETF，"
+                "適合定期定額長期持有，林區建議不要頻繁進出。"
+            )
+
+        # ── 組合結構視覺化 ──────────────────────────
+        if total_val:
+            st.markdown("---")
+            st.markdown("### 🥧 持股市值分配")
+            pie_labels = [r['代號'] for r in results if r['_val'] > 0]
+            pie_values = [r['_val']  for r in results if r['_val'] > 0]
+            pie_colors = []
+            for r in results:
+                if r['_val'] <= 0:
+                    continue
+                sc_ = r['_score']
+                if sc_ == 'ETF':
+                    pie_colors.append('#60A5FA')
+                elif isinstance(sc_, int) and sc_ >= 65:
+                    pie_colors.append('#4ADE80')
+                elif isinstance(sc_, int) and sc_ >= 50:
+                    pie_colors.append('#FBBF24')
+                else:
+                    pie_colors.append('#F87171')
+
+            fig_pie = go.Figure(go.Pie(
+                labels=pie_labels,
+                values=pie_values,
+                marker=dict(colors=pie_colors, line=dict(color='#0B1629', width=2)),
+                textinfo='label+percent',
+                hovertemplate='%{label}<br>市值：$%{value:,.0f}<br>佔比：%{percent}<extra></extra>',
+                hole=0.4
+            ))
+            fig_pie.update_layout(
+                template='plotly_dark',
+                height=380,
+                margin=dict(t=10, b=10, l=10, r=10),
+                legend=dict(font=dict(size=12)),
+                annotations=[dict(text='市值分配', x=0.5, y=0.5, font_size=14, showarrow=False)]
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
+            st.caption("🟢 林區評分 ≥ 65　🟡 50–64　🔴 < 50　🔵 ETF")
+
+        # ── 林區名言收尾 ────────────────────────────
+        st.markdown("---")
+        st.markdown("""
+> 💬 *「股票市場是把錢從急躁者的口袋，轉移到有耐心者的口袋。」— 彼得林區*
+
+**林區投資核心原則：**
+1. **了解你買的每一支股票**：說得出公司如何賺錢，才有資格持有。
+2. **PEG < 1 是最好的起點**：成長快、股價合理，才是林區的最愛。
+3. **不要因為股價下跌就賣**：如果基本面沒壞，跌是加碼機會。
+4. **長期持有才能讓複利發揮**：林區的 Magellan 基金年均報酬 29%，靠的是持有，不是頻繁交易。
+        """)
